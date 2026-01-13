@@ -1,15 +1,15 @@
 /**
- * Universal Clipboard Sync – WebSocket Server (FINAL)
+ * Universal Clipboard Sync – WebSocket Server (FINAL MERGED)
  *
- * - HTTPS + WSS compatible (Render / reverse proxy)
- * - Short-lived pairing tokens
- * - Multi-device presence per user
- * - Rule-based clipboard relay
- * - No cleartext assumptions
+ * Responsibilities:
+ * - Maintain user ↔ device connections
+ * - Issue short-lived pairing tokens (QR / code)
+ * - Authenticate devices (AUTH / AUTH_PAIR)
+ * - Maintain live device presence
+ * - Enforce per-device sync rules
+ * - Relay clipboard updates (content-type aware)
  *
- * NOTE:
- * - In-memory store (OK for now)
- * - Stateless clients
+ * Server is a trusted relay + state manager only
  */
 
 const express = require("express");
@@ -17,23 +17,10 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const app = express();
-app.use(express.json());
-
-/* =====================================================
-   Server (Render-compatible)
-===================================================== */
-
 const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-/**
- * IMPORTANT:
- * Render terminates TLS at the proxy.
- * Node receives plain HTTP, but WebSocket upgrades still work.
- */
-const wss = new WebSocket.Server({
-  server,
-  path: "/", // allow root upgrades
-});
+app.use(express.json());
 
 /* =====================================================
    In-memory Stores
@@ -42,12 +29,26 @@ const wss = new WebSocket.Server({
 /**
  * users:
  * userId -> Map(deviceId -> device)
+ *
+ * device = {
+ *   ws,
+ *   userId,
+ *   deviceId,
+ *   platform,
+ *   name,
+ *   rules,
+ *   lastSeen
+ * }
  */
 const users = new Map();
 
 /**
  * pairingTokens:
- * token -> { userId, type, expiresAt }
+ * token -> {
+ *   userId,
+ *   type: "qr" | "code",
+ *   expiresAt
+ * }
  */
 const pairingTokens = new Map();
 
@@ -58,24 +59,24 @@ const pairingTokens = new Map();
 function generateCode(length = 6) {
   return Math.random()
     .toString(36)
-    .slice(2, 2 + length)
+    .substring(2, 2 + length)
     .toUpperCase();
 }
 
-function cleanupExpiredTokens() {
+/**
+ * Cleanup expired pairing tokens
+ */
+setInterval(() => {
   const now = Date.now();
   for (const [token, record] of pairingTokens.entries()) {
-    if (record.expiresAt <= now) {
+    if (record.expiresAt < now) {
       pairingTokens.delete(token);
     }
   }
-}
-
-// cleanup every minute
-setInterval(cleanupExpiredTokens, 60_000);
+}, 60_000);
 
 /**
- * Send device list to all devices of a user
+ * Broadcast current device list to all devices of a user
  */
 function broadcastDeviceList(userId) {
   const deviceMap = users.get(userId);
@@ -84,6 +85,7 @@ function broadcastDeviceList(userId) {
   const devices = [...deviceMap.values()].map((d) => ({
     deviceId: d.deviceId,
     platform: d.platform,
+    name: d.name,
     rules: d.rules,
     lastSeen: d.lastSeen,
   }));
@@ -104,6 +106,14 @@ function broadcastDeviceList(userId) {
    HTTP API – Pairing
 ===================================================== */
 
+/**
+ * POST /pair
+ * Body:
+ * {
+ *   userId: string,
+ *   type: "qr" | "code"
+ * }
+ */
 app.post("/pair", (req, res) => {
   const { userId, type } = req.body;
 
@@ -136,23 +146,18 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (raw) => {
     let data;
-
     try {
       data = JSON.parse(raw.toString());
     } catch {
-      ws.send(
-        JSON.stringify({
-          type: "ERROR",
-          message: "Invalid JSON",
-        })
-      );
+      ws.send(JSON.stringify({ type: "ERROR", message: "Invalid JSON" }));
       return;
     }
 
-    /* ---------------- AUTH (trusted / host) ---------------- */
-
+    /* -----------------------------------------------
+       AUTH – Direct
+    ------------------------------------------------ */
     if (data.type === "AUTH") {
-      const { userId, deviceId, platform } = data;
+      const { userId, deviceId, platform, name } = data;
       if (!userId || !deviceId) return;
 
       device = {
@@ -160,14 +165,15 @@ wss.on("connection", (ws) => {
         userId,
         deviceId,
         platform,
-        rules: { text: true, image: false },
+        name: name || platform,
+        rules: {
+          text: true,
+          image: false,
+        },
         lastSeen: Date.now(),
       };
 
-      if (!users.has(userId)) {
-        users.set(userId, new Map());
-      }
-
+      if (!users.has(userId)) users.set(userId, new Map());
       users.get(userId).set(deviceId, device);
 
       ws.send(JSON.stringify({ type: "AUTH_OK", userId }));
@@ -175,13 +181,14 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* ---------------- AUTH_PAIR (QR / code) ---------------- */
-
+    /* -----------------------------------------------
+       AUTH_PAIR – Paired devices
+    ------------------------------------------------ */
     if (data.type === "AUTH_PAIR") {
-      const { pairingToken, deviceId, platform } = data;
+      const { pairingToken, deviceId, platform, name } = data;
 
       const record = pairingTokens.get(pairingToken);
-      if (!record || record.expiresAt <= Date.now()) {
+      if (!record || record.expiresAt < Date.now()) {
         ws.send(JSON.stringify({ type: "AUTH_FAIL" }));
         return;
       }
@@ -193,71 +200,72 @@ wss.on("connection", (ws) => {
         userId: record.userId,
         deviceId,
         platform,
-        rules: { text: true, image: false },
+        name: name || platform,
+        rules: {
+          text: true,
+          image: false,
+        },
         lastSeen: Date.now(),
       };
 
-      if (!users.has(record.userId)) {
-        users.set(record.userId, new Map());
-      }
-
+      if (!users.has(record.userId)) users.set(record.userId, new Map());
       users.get(record.userId).set(deviceId, device);
 
-      ws.send(
-        JSON.stringify({
-          type: "AUTH_OK",
-          userId: record.userId,
-        })
-      );
-
+      ws.send(JSON.stringify({ type: "AUTH_OK", userId: record.userId }));
       broadcastDeviceList(record.userId);
       return;
     }
 
-    /* ---------------- Reject unauthenticated ---------------- */
-
+    /* -----------------------------------------------
+       Block unauthenticated access
+    ------------------------------------------------ */
     if (!device) {
-      ws.send(
-        JSON.stringify({
-          type: "ERROR",
-          message: "Not authenticated",
-        })
-      );
+      ws.send(JSON.stringify({ type: "ERROR", message: "Not authenticated" }));
       return;
     }
 
     device.lastSeen = Date.now();
 
-    /* ---------------- Update rules ---------------- */
-
-    if (data.type === "UPDATE_RULES" && typeof data.rules === "object") {
-      device.rules = { ...device.rules, ...data.rules };
-      broadcastDeviceList(device.userId);
+    /* -----------------------------------------------
+       Update per-device rules
+    ------------------------------------------------ */
+    if (data.type === "UPDATE_RULES") {
+      if (typeof data.rules === "object") {
+        device.rules = { ...device.rules, ...data.rules };
+        broadcastDeviceList(device.userId);
+      }
       return;
     }
 
-    /* ---------------- Clipboard relay ---------------- */
-
+    /* -----------------------------------------------
+       Clipboard Update Relay
+    ------------------------------------------------ */
     if (data.type === "CLIP_UPDATE") {
       const peers = users.get(device.userId);
       if (!peers) return;
 
       for (const d of peers.values()) {
         if (d.deviceId === device.deviceId) continue;
-        if (d.ws.readyState !== WebSocket.OPEN) continue;
 
+        // Enforce per-device rules
         if (data.contentType === "text" && !d.rules.text) continue;
         if (data.contentType === "image" && !d.rules.image) continue;
 
-        d.ws.send(
-          JSON.stringify({
-            type: "CLIP_SYNC",
-            from: device.deviceId,
-            timestamp: data.timestamp,
-            contentType: data.contentType,
-            payload: data.payload,
-          })
-        );
+        if (d.ws.readyState === WebSocket.OPEN) {
+          d.ws.send(
+            JSON.stringify({
+              type: "CLIP_SYNC",
+              payload: data.payload,
+              contentType: data.contentType,
+              timestamp: Date.now(),
+              from: {
+                deviceId: device.deviceId,
+                name: device.name,
+                platform: device.platform,
+              },
+            })
+          );
+        }
       }
     }
   });
@@ -279,13 +287,9 @@ wss.on("connection", (ws) => {
 });
 
 /* =====================================================
-   Start Server (Render)
+   Start Server
 ===================================================== */
 
-const PORT = process.env.PORT || 8080;
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("✅ Universal Clipboard Server running");
-  console.log(`HTTP  https://abracadabra-0n55.onrender.com`);
-  console.log(`WSS   wss://abracadabra-0n55.onrender.com`);
+server.listen(8080, "0.0.0.0", () => {
+  console.log("✅ Universal Clipboard Server running on :8080");
 });
