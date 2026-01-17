@@ -186,6 +186,20 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (data.type === "FILE_OFFER") {
+      const peers = users.get(device.userId);
+      for (const d of peers.values()) {
+        if (d.deviceId === device.deviceId) continue;
+        d.ws.send(
+          JSON.stringify({
+            type: "FILE_SYNC",
+            ...data,
+            from: device.deviceId,
+          }),
+        );
+      }
+    }
+
     /* -------------------------------------------------
        AUTH / AUTH_PAIR
     ------------------------------------------------- */
